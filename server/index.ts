@@ -29,6 +29,7 @@ import {
   AMOUNT_USDC,
   AMOUNT_STROOPS
 } from '../src/lib/constants'
+import { getServerFeatureFlags } from '../src/lib/featureFlags'
 import { consumePaymentPayload } from '../src/lib/paymentIntegrity'
 import {
   normalizeOrganicResults,
@@ -88,6 +89,32 @@ app.use(
 app.use(cors(buildCorsOptions()))
 app.use(express.json())
 app.use(limiter)
+
+// ─── Feature Flag Validation ─────────────────────────────────────────────
+// Get server-side feature flags
+const featureFlags = getServerFeatureFlags()
+
+// Log feature flag configuration at startup
+console.log('🚀 Feature Flags Configuration:')
+console.log(`   Payment: ${featureFlags.paymentEnabled ? '✅' : '❌'}`)
+console.log(`   AI: ${featureFlags.aiEnabled ? '✅' : '❌'}`)
+console.log(`   Search Modes: ${featureFlags.searchModeEnabled ? '✅' : '❌'}`)
+console.log(`   Integrations: ${featureFlags.integrationEnabled ? '✅' : '❌'}`)
+
+// Middleware to validate feature flags for specific routes
+const validateFeatureFlag = (feature: keyof typeof featureFlags) => {
+  return (req: Request, res: Response, next: Function) => {
+    if (!featureFlags[feature]) {
+      const featureName = feature.replace('Enabled', '').toLowerCase()
+      return res.status(404).json({
+        error: `Feature "${featureName}" is disabled`,
+        message: 'This feature has been disabled via feature flags',
+        feature: featureName,
+      })
+    }
+    next()
+  }
+}
 
 // ─── In-memory stats ──────────────────────────────────────────────────────
 const stats = {
@@ -164,12 +191,22 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(paymentMiddlewareFromConfig(x402Routes, facilitatorClient, schemes))
+// Apply payment middleware only if payment feature is enabled
+if (featureFlags.paymentEnabled) {
+  app.use(paymentMiddlewareFromConfig(x402Routes, facilitatorClient, schemes))
+} else {
+  console.log('⚠  Payment middleware disabled via feature flag')
+}
 
 // ─── Payment Replay Protection Middleware ─────────────────────────────────
 app.use((req, res, next) => {
   const paidRoutes = ['/search', '/images', '/news']
   if (paidRoutes.includes(req.path)) {
+    // If payment is disabled, skip payment validation
+    if (!featureFlags.paymentEnabled) {
+      return next()
+    }
+    
     const paymentHeader =
       req.headers['payment-signature'] ||
       req.headers['x-payment'] ||
@@ -211,7 +248,7 @@ export function validateQuery(
 }
 
 // ─── GET /search ──────────────────────────────────────────────────────────
-app.get('/search', async (req: Request, res: Response) => {
+app.get('/search', validateFeatureFlag('paymentEnabled'), async (req: Request, res: Response) => {
   const { q, count = '5', freshness } = req.query as Record<string, string>
 
   const v = validateQuery(q)
@@ -327,7 +364,7 @@ app.get('/search', async (req: Request, res: Response) => {
 })
 
 // ─── GET /images ──────────────────────────────────────────────────────────
-app.get('/images', async (req: Request, res: Response) => {
+app.get('/images', validateFeatureFlag('searchModeEnabled'), async (req: Request, res: Response) => {
   const { q, count = '10' } = req.query as Record<string, string>
 
   const v = validateQuery(q)
@@ -391,7 +428,7 @@ app.get('/images', async (req: Request, res: Response) => {
 })
 
 // ─── GET /news ────────────────────────────────────────────────────────────
-app.get('/news', async (req: Request, res: Response) => {
+app.get('/news', validateFeatureFlag('searchModeEnabled'), async (req: Request, res: Response) => {
   const { q, count = '10', freshness } = req.query as Record<string, string>
 
   const v = validateQuery(q)
@@ -489,6 +526,12 @@ app.get('/health', (_req: Request, res: Response) => {
     serperApiConfigured:       !!SERPER_API_KEY,
     groqApiConfigured:         !!GROQ_API_KEY,
     receivingAddressConfigured: !!RECEIVING_ADDRESS,
+    featureFlags: {
+      payment: featureFlags.paymentEnabled,
+      ai: featureFlags.aiEnabled,
+      searchModes: featureFlags.searchModeEnabled,
+      integrations: featureFlags.integrationEnabled,
+    },
   })
 })
 
@@ -496,7 +539,7 @@ app.get('/health', (_req: Request, res: Response) => {
 // Streams responses as Server-Sent Events when the client sends
 // `Accept: text/event-stream`; otherwise returns the full completion as JSON
 // (back-compat fallback for callers that don't support SSE).
-app.post('/ai/chat', async (req: Request, res: Response) => {
+app.post('/ai/chat', validateFeatureFlag('aiEnabled'), async (req: Request, res: Response) => {
   const { messages, model: requestedModel } = req.body as {
     messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
     model?: string
@@ -597,17 +640,36 @@ app.post('/ai/chat', async (req: Request, res: Response) => {
 
 // ─── GET / ────────────────────────────────────────────────────────────────
 app.get('/', (_req: Request, res: Response) => {
+  const endpoints: Record<string, string> = {
+    'GET /health': 'Live server stats',
+  }
+  
+  // Only include endpoints that are enabled via feature flags
+  if (featureFlags.paymentEnabled) {
+    endpoints['GET /search?q=<query>'] = '0.001 USDC via x402'
+  }
+  
+  if (featureFlags.searchModeEnabled) {
+    endpoints['GET /images?q=<query>'] = '0.001 USDC via x402 — image results'
+    endpoints['GET /news?q=<query>'] = '0.001 USDC via x402 — news articles'
+  }
+  
+  if (featureFlags.aiEnabled) {
+    endpoints['POST /ai/chat'] = 'Groq AI — free'
+  }
+  
+  // Include feature flag status in response
   res.json({
     name:        'StellarSearch',
     version:     '1.0.0',
     description: 'Pay-per-query web search for AI agents via x402 on Stellar',
-    endpoints: {
-      'GET /search?q=<query>': '0.001 USDC via x402',
-      'GET /images?q=<query>': '0.001 USDC via x402 — image results',
-      'GET /news?q=<query>':   '0.001 USDC via x402 — news articles',
-      'POST /ai/chat':         'Groq AI — free',
-      'GET /health':           'Live server stats',
+    featureFlags: {
+      payment: featureFlags.paymentEnabled,
+      ai: featureFlags.aiEnabled,
+      searchModes: featureFlags.searchModeEnabled,
+      integrations: featureFlags.integrationEnabled,
     },
+    endpoints,
   })
 })
 
